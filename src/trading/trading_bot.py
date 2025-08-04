@@ -31,6 +31,20 @@ class TradingBot:
         """
         return self.client.authenticate()
 
+    def get_buying_power(self) -> float:
+        """
+        Get current buying power from the account.
+        """
+        return self.client.get_buying_power()
+
+    def check_buying_power_for_order(self, amount: float) -> bool:
+        """
+        Check if there's enough buying power for a given USD amount.
+        Returns True if sufficient, False otherwise.
+        """
+        buying_power = self.get_buying_power()
+        return buying_power >= amount
+
     def format_portfolio(self) -> str:
         """
         Fetch and format the user's crypto portfolio as a table.
@@ -97,6 +111,17 @@ class TradingBot:
             raise ValueError("Invalid symbol format")
         if not symbol.endswith('-USD'):
             symbol = f"{symbol}-USD"
+        
+        # Check buying power before attempting to place order
+        buying_power = self.client.get_buying_power()
+        if buying_power < amount:
+            raise ValueError(
+                f"Insufficient buying power\n"
+                f"Requested: ${amount:.2f}\n"
+                f"Available: ${buying_power:.2f}\n"
+                f"Shortfall: ${amount - buying_power:.2f}"
+            )
+        
         result = self.client.place_market_buy_order(
             symbol=symbol,
             quote_amount=str(amount)
@@ -135,19 +160,22 @@ class TradingBot:
         if current_price == 0:
             raise RuntimeError(f"Invalid price data for {symbol}")
         quantity_to_sell = Decimal(str(amount)) / current_price
+        # Round to 8 decimal places to avoid Robinhood's decimal place limit
+        quantity_to_sell_rounded = quantity_to_sell.quantize(Decimal('0.00000001'), rounding='ROUND_DOWN')
+        
         current_quantity = Decimal(holding.get('quantity_available_for_trading', '0'))
-        if quantity_to_sell > current_quantity:
+        if quantity_to_sell_rounded > current_quantity:
             raise ValueError(
                 f"Insufficient {symbol} balance\n"
-                f"Requested: {quantity_to_sell:.8f}\n"
+                f"Requested: {quantity_to_sell_rounded:.8f}\n"
                 f"Available: {current_quantity:.8f}"
             )
         result = self.client.place_market_sell_order(
             symbol=symbol,
-            asset_quantity=str(quantity_to_sell)
+            asset_quantity=str(quantity_to_sell_rounded)
         )
         if result:
-            logger.info(f"Sell order placed: {quantity_to_sell:.8f} {symbol}")
+            logger.info(f"Sell order placed: {quantity_to_sell_rounded:.8f} {symbol}")
             logger.info(f"Order ID: {result.get('id', 'Unknown')}")
         else:
             logger.error(f"Failed to place sell order for {symbol}")

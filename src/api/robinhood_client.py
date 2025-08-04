@@ -11,7 +11,7 @@ import base64
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import requests
 from nacl.signing import SigningKey
 from src.config.settings import settings
@@ -26,6 +26,7 @@ class RobinhoodClient:
     HOLDINGS_ENDPOINT = '/api/v1/crypto/trading/holdings/'
     ORDERS_ENDPOINT = '/api/v1/crypto/trading/orders/'
     PRICES_ENDPOINT = '/api/v1/crypto/marketdata/best_bid_ask/'
+    TRADING_PAIRS_ENDPOINT = '/api/v1/crypto/trading/trading_pairs/'
 
     def __init__(self):
         """
@@ -43,6 +44,21 @@ class RobinhoodClient:
     def _get_current_timestamp() -> int:
         """Get current UTC timestamp in seconds."""
         return int(datetime.now(tz=timezone.utc).timestamp())
+
+    @staticmethod
+    def _round_asset_quantity(asset_quantity: str) -> str:
+        """
+        Round asset quantity to 8 decimal places to comply with Robinhood's requirements.
+        This prevents the "must have at most 18 decimal places" error.
+        """
+        from decimal import Decimal
+        try:
+            quantity = Decimal(asset_quantity)
+            rounded = quantity.quantize(Decimal('0.00000001'), rounding='ROUND_DOWN')
+            return str(rounded)
+        except (ValueError, TypeError):
+            # If conversion fails, return original value
+            return asset_quantity
 
     def _sign_request(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         """
@@ -154,19 +170,41 @@ class RobinhoodClient:
     def place_market_buy_order(self, symbol: str, quote_amount: str) -> Optional[Dict]:
         """
         Place a market buy order for a given symbol and USD amount.
+        Robinhood API requires asset_quantity for market orders, so we calculate it from the current price.
         """
         try:
             import uuid
+            from decimal import Decimal
+            
+            # Get current price to calculate asset quantity
+            price_data = self.get_crypto_price(symbol)
+            if not price_data or 'price' not in price_data:
+                self.logger.error(f"Could not get current price for {symbol}")
+                return None
+            
+            current_price = Decimal(price_data['price'])
+            if current_price <= 0:
+                self.logger.error(f"Invalid price for {symbol}: {current_price}")
+                return None
+            
+            # Calculate asset quantity from USD amount
+            quote_amount_decimal = Decimal(quote_amount)
+            asset_quantity = quote_amount_decimal / current_price
+            
+            # Round to 8 decimal places (standard for most cryptocurrencies)
+            # This ensures we don't exceed Robinhood's 18 decimal place limit
+            asset_quantity_rounded = asset_quantity.quantize(Decimal('0.00000001'), rounding='ROUND_DOWN')
+            
             order_data = {
                 "client_order_id": str(uuid.uuid4()),
                 "symbol": symbol.upper(),
                 "side": "buy",
                 "type": "market",
                 "market_order_config": {
-                    "quote_amount": str(quote_amount)
+                    "asset_quantity": str(asset_quantity_rounded)
                 }
             }
-            self.logger.info(f"Placing market buy order: {symbol} for ${quote_amount}")
+            self.logger.info(f"Placing market buy order: {symbol} for ${quote_amount} (≈ {asset_quantity_rounded} {symbol.replace('-USD', '')})")
             return self._make_request('POST', self.ORDERS_ENDPOINT, json=order_data)
         except Exception as e:
             self.logger.error(f"Error placing market buy order: {str(e)}")
@@ -184,7 +222,7 @@ class RobinhoodClient:
                 "side": "sell",
                 "type": "market",
                 "market_order_config": {
-                    "asset_quantity": str(asset_quantity)
+                    "asset_quantity": self._round_asset_quantity(asset_quantity)
                 }
             }
             self.logger.info(f"Placing market sell order: {asset_quantity} {symbol}")
@@ -207,4 +245,188 @@ class RobinhoodClient:
             return 0.00
         except Exception as e:
             self.logger.error(f"Error getting buying power: {str(e)}")
-            return 0.00 
+            return 0.00
+
+    def get_trading_pairs(self, symbols: Optional[List[str]] = None, limit: Optional[int] = None) -> Optional[Dict]:
+        """
+        Get crypto trading pairs.
+        
+        Args:
+            symbols: List of trading pair symbols (e.g., ['BTC-USD', 'ETH-USD'])
+            limit: Limit the number of results per page size
+        """
+        try:
+            params = {}
+            if symbols:
+                for symbol in symbols:
+                    params.setdefault('symbol', []).append(symbol.upper())
+            if limit:
+                params['limit'] = limit
+            
+            query_string = '&'.join([f"{k}={v}" if not isinstance(v, list) else '&'.join([f"{k}={item}" for item in v]) for k, v in params.items()])
+            endpoint = f"{self.TRADING_PAIRS_ENDPOINT}?{query_string}" if query_string else self.TRADING_PAIRS_ENDPOINT
+            
+            return self._make_request('GET', endpoint)
+        except Exception as e:
+            self.logger.error(f"Error getting trading pairs: {str(e)}")
+            return None
+
+    def get_orders(self, 
+                   symbol: Optional[str] = None,
+                   side: Optional[str] = None,
+                   state: Optional[str] = None,
+                   order_type: Optional[str] = None,
+                   limit: Optional[int] = None,
+                   created_at_start: Optional[str] = None,
+                   created_at_end: Optional[str] = None,
+                   updated_at_start: Optional[str] = None,
+                   updated_at_end: Optional[str] = None) -> Optional[Dict]:
+        """
+        Get crypto orders for the current user.
+        
+        Args:
+            symbol: Currency pair symbol (e.g., 'BTC-USD')
+            side: 'buy' or 'sell'
+            state: 'open', 'canceled', 'partially_filled', 'filled', 'failed'
+            order_type: 'limit', 'market', 'stop_limit', 'stop_loss'
+            limit: Limit the number of results per page size
+            created_at_start: Filter by created at start time (ISO 8601 format)
+            created_at_end: Filter by created at end time (ISO 8601 format)
+            updated_at_start: Filter by updated at start time (ISO 8601 format)
+            updated_at_end: Filter by updated at end time (ISO 8601 format)
+        """
+        try:
+            params = {}
+            if symbol:
+                params['symbol'] = symbol.upper()
+            if side:
+                params['side'] = side
+            if state:
+                params['state'] = state
+            if order_type:
+                params['type'] = order_type
+            if limit:
+                params['limit'] = limit
+            if created_at_start:
+                params['created_at_start'] = created_at_start
+            if created_at_end:
+                params['created_at_end'] = created_at_end
+            if updated_at_start:
+                params['updated_at_start'] = updated_at_start
+            if updated_at_end:
+                params['updated_at_end'] = updated_at_end
+            
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            endpoint = f"{self.ORDERS_ENDPOINT}?{query_string}" if query_string else self.ORDERS_ENDPOINT
+            
+            return self._make_request('GET', endpoint)
+        except Exception as e:
+            self.logger.error(f"Error getting orders: {str(e)}")
+            return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        """
+        Cancel an open crypto trading order.
+        
+        Args:
+            order_id: The order ID to cancel
+        """
+        try:
+            endpoint = f"{self.ORDERS_ENDPOINT}{order_id}/cancel/"
+            response = self._make_request('POST', endpoint)
+            return response is not None
+        except Exception as e:
+            self.logger.error(f"Error canceling order {order_id}: {str(e)}")
+            return False
+
+    def place_limit_order(self, symbol: str, side: str, asset_quantity: str, limit_price: str, time_in_force: str = "gtc") -> Optional[Dict]:
+        """
+        Place a limit order for crypto trading.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., 'BTC-USD')
+            side: 'buy' or 'sell'
+            asset_quantity: Quantity of the asset to trade
+            limit_price: Limit price for the order
+            time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
+        """
+        try:
+            import uuid
+            order_data = {
+                "client_order_id": str(uuid.uuid4()),
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": "limit",
+                "limit_order_config": {
+                    "asset_quantity": self._round_asset_quantity(asset_quantity),
+                    "limit_price": str(limit_price),
+                    "time_in_force": time_in_force
+                }
+            }
+            self.logger.info(f"Placing limit {side} order: {asset_quantity} {symbol} at ${limit_price}")
+            return self._make_request('POST', self.ORDERS_ENDPOINT, json=order_data)
+        except Exception as e:
+            self.logger.error(f"Error placing limit order: {str(e)}")
+            return None
+
+    def place_stop_loss_order(self, symbol: str, side: str, asset_quantity: str, stop_price: str, time_in_force: str = "gtc") -> Optional[Dict]:
+        """
+        Place a stop loss order for crypto trading.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., 'BTC-USD')
+            side: 'buy' or 'sell'
+            asset_quantity: Quantity of the asset to trade
+            stop_price: Stop price that triggers the order
+            time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
+        """
+        try:
+            import uuid
+            order_data = {
+                "client_order_id": str(uuid.uuid4()),
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": "stop_loss",
+                "stop_loss_order_config": {
+                    "asset_quantity": self._round_asset_quantity(asset_quantity),
+                    "stop_price": str(stop_price),
+                    "time_in_force": time_in_force
+                }
+            }
+            self.logger.info(f"Placing stop loss {side} order: {asset_quantity} {symbol} at stop price ${stop_price}")
+            return self._make_request('POST', self.ORDERS_ENDPOINT, json=order_data)
+        except Exception as e:
+            self.logger.error(f"Error placing stop loss order: {str(e)}")
+            return None
+
+    def place_stop_limit_order(self, symbol: str, side: str, asset_quantity: str, limit_price: str, stop_price: str, time_in_force: str = "gtc") -> Optional[Dict]:
+        """
+        Place a stop limit order for crypto trading.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., 'BTC-USD')
+            side: 'buy' or 'sell'
+            asset_quantity: Quantity of the asset to trade
+            limit_price: Limit price for the order
+            stop_price: Stop price that triggers the order
+            time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
+        """
+        try:
+            import uuid
+            order_data = {
+                "client_order_id": str(uuid.uuid4()),
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": "stop_limit",
+                "stop_limit_order_config": {
+                    "asset_quantity": self._round_asset_quantity(asset_quantity),
+                    "limit_price": str(limit_price),
+                    "stop_price": str(stop_price),
+                    "time_in_force": time_in_force
+                }
+            }
+            self.logger.info(f"Placing stop limit {side} order: {asset_quantity} {symbol} at limit ${limit_price}, stop ${stop_price}")
+            return self._make_request('POST', self.ORDERS_ENDPOINT, json=order_data)
+        except Exception as e:
+            self.logger.error(f"Error placing stop limit order: {str(e)}")
+            return None 
