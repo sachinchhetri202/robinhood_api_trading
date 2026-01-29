@@ -17,6 +17,8 @@ This project lets you:
 - Place buy and sell orders (market, limit, stop loss, stop limit)
 - View order history and manage open orders
 - Cancel open orders
+- Track portfolio stats and performance
+- Persist automated strategy configurations
 - All from a simple, secure command-line interface
 
 No web browser needed!
@@ -85,9 +87,20 @@ No web browser needed!
 
 ### Getting Your Robinhood API Credentials
 
+You have two options:
+
+**Option 1: Generate your own keypair (Recommended)**
+1. Run `python generate_keypair.py` to generate a keypair
+2. Copy the **PRIVATE KEY** to your `.env` file as `BASE64_PRIVATE_KEY`
+3. Copy the **PUBLIC KEY** and provide it to Robinhood when creating your API key
+4. Robinhood will give you an `API_KEY` - add it to your `.env` file
+
+**Option 2: Use Robinhood's generated keys**
 1. **Enable API access** in your Robinhood account settings
 2. **Generate API key and private key** from Robinhood developer portal
 3. **Keep them secure** - never share or commit to version control
+
+> **💡 Tip:** Option 1 gives you more control and security by generating keys locally.
 
 ### Create Your .env File
 
@@ -109,6 +122,52 @@ ROBINHOOD_API_BASE_URL=https://trading.robinhood.com
 
 > **📚 Need help?** [See Robinhood API docs for credential setup details.](https://docs.robinhood.com/crypto/trading/)
 
+### Local Config File
+
+The CLI also stores local preferences in:
+```
+~/.robinhood_trading/config.json
+```
+
+You can configure:
+- API timeout and retry settings
+- Rate limits
+- Circuit breaker thresholds
+- File logging defaults
+
+### Helper Script: Generate Keypair
+
+This project includes a helper script `generate_keypair.py` to generate your own Ed25519 keypair for Robinhood API:
+
+```bash
+# Generate a keypair
+python generate_keypair.py
+```
+
+**How to use the generated keys:**
+
+1. **Copy the PRIVATE KEY (Base64)** → Add it to your `.env` file as `BASE64_PRIVATE_KEY`
+2. **Copy the PUBLIC KEY (Base64)** → Provide it to Robinhood when creating your API key in their developer portal
+3. **Get your API_KEY** → Robinhood will give you an `API_KEY` that matches your public key
+4. **Add API_KEY to .env** → Add the `API_KEY` from Robinhood to your `.env` file
+
+**Complete workflow:**
+```bash
+# 1. Generate keypair
+python generate_keypair.py
+
+# 2. Copy private key to .env
+# BASE64_PRIVATE_KEY=<private_key_from_script>
+
+# 3. Go to Robinhood Developer Portal and create API key
+# Paste the PUBLIC KEY from the script
+
+# 4. Add API_KEY from Robinhood to .env
+# API_KEY=<api_key_from_robinhood>
+```
+
+**Security Note:** Keep your private key secure and never share it. Only the public key should be provided to Robinhood.
+
 ---
 
 ## 🎯 Complete Command Reference
@@ -118,17 +177,29 @@ ROBINHOOD_API_BASE_URL=https://trading.robinhood.com
 # See all available commands
 python main.py --help
 
+# Start the interactive shell (default)
+python main.py
+
 # Run any command with debug output
 python main.py --debug portfolio
+
+# Enable file logging (writes to ~/.robinhood_trading/logs/)
+python main.py --log-file portfolio
 ```
 
 ### 📊 Portfolio & Holdings
 ```bash
+# In interactive shell:
+# trading> portfolio
+
 # View your complete portfolio with holdings and buying power
 python main.py portfolio
 
 # Show portfolio performance (best/worst performers)
 python main.py portfolio-performance
+
+# Show detailed portfolio statistics
+python main.py portfolio-stats
 ```
 
 ### 💰 Price Checking
@@ -145,7 +216,7 @@ python main.py prices BTC-USD ETH-USD
 
 ### 🔄 Trading Pairs
 ```bash
-# View all available trading pairs
+# View all available tradable pairs
 python main.py trading-pairs
 
 # View specific trading pairs
@@ -185,6 +256,15 @@ python main.py orders --limit 5
 python main.py orders --symbol BTC-USD --state open --side buy
 ```
 
+### 🧾 Trade History
+```bash
+# View filled orders (trade history)
+python main.py trade-history
+
+# Filter by symbol and limit results
+python main.py trade-history --symbol BTC-USD --limit 10
+```
+
 ### 💰 Buying Power
 ```bash
 # Check your current buying power
@@ -207,6 +287,21 @@ python main.py sell BTC 10
 
 # Sell $15 worth of Ethereum (if you have holdings)
 python main.py sell ETH 15
+```
+
+### 🧩 Advanced Orders (Limit/Stop/Stop Limit)
+```bash
+# Limit buy/sell (asset quantity + price)
+python main.py limit-buy BTC-USD 0.001 50000
+python main.py limit-sell BTC-USD 0.001 55000
+
+# Stop loss buy/sell (asset quantity + stop price)
+python main.py stop-loss-buy BTC-USD 0.001 48000
+python main.py stop-loss-sell BTC-USD 0.001 48000
+
+# Stop limit buy/sell (asset quantity + limit + stop)
+python main.py stop-limit-buy BTC-USD 0.001 50000 49000
+python main.py stop-limit-sell BTC-USD 0.001 50000 49000
 ```
 
 > **💡 Smart Validation**: The app now checks your buying power before placing orders and provides helpful error messages if you don't have enough funds.
@@ -241,6 +336,18 @@ python main.py dca-strategy ETH --amount 25 --frequency 14 --max-purchases 24
 ```bash
 # Start all configured strategies
 python main.py auto-trade
+```
+
+#### Strategy Management
+```bash
+# List configured strategies
+python main.py list-strategies
+
+# Remove a strategy by key
+python main.py remove-strategy stop_loss_BTC-USD
+
+# Load strategies from disk
+python main.py load-strategies
 ```
 
 > **⚠️ Important**: Automated trading involves real money. Test with small amounts first and monitor closely.
@@ -308,9 +415,34 @@ python main.py portfolio
 
 ## 🔧 Advanced Usage
 
-### API-Only Features
+### Helper Tools
 
-The following order types are available through the API client but not yet exposed via CLI:
+#### Keypair Generator
+
+Generate your own Ed25519 keypair for Robinhood API authentication:
+
+```bash
+# Generate a keypair
+python generate_keypair.py
+```
+
+**Workflow:**
+1. Run the script to generate a keypair
+2. **Private Key** → Add to `.env` as `BASE64_PRIVATE_KEY`
+3. **Public Key** → Provide to Robinhood when creating API key
+4. **API Key** → Robinhood gives you an `API_KEY` that matches your public key
+
+**Benefits:**
+- Generate keys locally (more secure)
+- Full control over your keypair
+- No need to download keys from Robinhood
+- Standard Ed25519 cryptography
+
+See the [Configuration section](#-configuration) above for detailed setup instructions.
+
+### Advanced Order Types
+
+The following order types are available through both the CLI and API client:
 
 - **Limit Orders**: Place orders at specific prices
 - **Stop Loss Orders**: Automatic sell when price drops to a certain level
@@ -440,6 +572,38 @@ Run with coverage:
 pytest --cov=src tests/
 ```
 
+## Build a Compressed .pyz
+
+You can bundle the app into a single executable archive (requires Python on the target machine):
+
+```bash
+python scripts/build_zipapp.py
+python dist/robinhood_cli.pyz --help
+```
+
+Notes:
+- Dependencies are not bundled; install `requirements.txt` on the target machine.
+- The .pyz respects your `.env` in the current working directory.
+
+## Build a Standalone Executable (Recommended for non-coders)
+
+You can build a double-clickable app that opens a terminal with the trading shell:
+
+```bash
+python scripts/build_executable.py
+./dist/RobinhoodTradingCLI
+```
+
+Notes:
+- This uses PyInstaller to create a single-file executable.
+- Keep your `.env` in the folder where you run the executable.
+- On macOS, double-clicking the binary opens a terminal window running the shell.
+
+## Docs
+
+- `docs/API.md` - API and client usage details
+- `docs/STRATEGIES.md` - Automated strategy behavior and persistence
+
 ---
 
 ## Recent Updates
@@ -475,9 +639,9 @@ This CLI now supports **all** Robinhood crypto trading API endpoints:
 | ✅ Get Orders | Complete | `orders` |
 | ✅ Get Buying Power | Complete | `buying-power` |
 | ✅ Place Market Orders | Complete | `buy`, `sell` |
-| ✅ Place Limit Orders | Complete | API only |
-| ✅ Place Stop Loss Orders | Complete | API only |
-| ✅ Place Stop Limit Orders | Complete | API only |
+| ✅ Place Limit Orders | Complete | `limit-buy`, `limit-sell` |
+| ✅ Place Stop Loss Orders | Complete | `stop-loss-buy`, `stop-loss-sell` |
+| ✅ Place Stop Limit Orders | Complete | `stop-limit-buy`, `stop-limit-sell` |
 | ✅ Cancel Orders | Complete | `cancel` |
 | ✅ Authentication | Complete | All commands |
 | ✅ Price Data | Complete | `prices` |
@@ -485,6 +649,8 @@ This CLI now supports **all** Robinhood crypto trading API endpoints:
 | ✅ Stop Loss Strategy | Complete | `stop-loss-strategy` |
 | ✅ DCA Strategy | Complete | `dca-strategy` |
 | ✅ Automated Trading | Complete | `auto-trade` |
+| ✅ Portfolio Stats | Complete | `portfolio-stats` |
+| ✅ Trade History | Complete | `trade-history` |
 
 ## 🎉 You're All Set!
 

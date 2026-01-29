@@ -10,11 +10,14 @@ Handles authentication, signing, and all core crypto trading API calls.
 import base64
 import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
 import requests
 from nacl.signing import SigningKey
 from src.config.settings import settings
+from src.utils.rate_limiter import RateLimiter
 
 class RobinhoodClient:
     """
@@ -35,9 +38,23 @@ class RobinhoodClient:
         self.logger = logging.getLogger(__name__)
         self.session = requests.Session()
         self.is_authenticated = False
+        self.rate_limiter = RateLimiter(settings.RATE_LIMIT_PER_MINUTE)
+        self.failure_count = 0
+        self.circuit_open_until = 0
         # Prepare Ed25519 signing key
-        private_key_seed = base64.b64decode(settings.BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
+        if not settings.BASE64_PRIVATE_KEY:
+            raise ValueError(
+                "BASE64_PRIVATE_KEY is not set. Please add it to your .env file.\n"
+                "Run 'python generate_keypair.py' to generate a keypair if needed."
+            )
+        try:
+            private_key_seed = base64.b64decode(settings.BASE64_PRIVATE_KEY)
+            self.private_key = SigningKey(private_key_seed)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to decode BASE64_PRIVATE_KEY: {str(e)}\n"
+                "Please check that your private key is correctly base64 encoded."
+            )
         # Do not set log level here; let main CLI control it
 
     @staticmethod
@@ -64,6 +81,11 @@ class RobinhoodClient:
         """
         Sign a request using Ed25519 and return the required headers.
         """
+        if not settings.API_KEY:
+            raise ValueError(
+                "API_KEY is not set. Please add it to your .env file.\n"
+                "Get your API_KEY from the Robinhood Developer Portal."
+            )
         try:
             timestamp = self._get_current_timestamp()
             message = f"{settings.API_KEY}{timestamp}{path}{method}{body}"
@@ -80,56 +102,128 @@ class RobinhoodClient:
             self.logger.error(f"Error signing request: {str(e)}")
             raise
 
+    def _build_url(self, endpoint: str) -> str:
+        """Build a full URL from the base and endpoint."""
+        endpoint_clean = endpoint.lstrip("/") if settings.ROBINHOOD_API_BASE_URL.endswith("/") else endpoint
+        return f"{settings.ROBINHOOD_API_BASE_URL}{endpoint_clean}"
+
+    def _prepare_body(self, kwargs: Dict) -> str:
+        body = ""
+        if "json" in kwargs:
+            body = json.dumps(kwargs["json"])
+            self.logger.debug(f"Request body: {body}")
+        return body
+
+    def _prepare_headers(self, method: str, endpoint: str, body: str, kwargs: Dict) -> Dict[str, str]:
+        headers = self._sign_request(method, endpoint, body)
+        if "json" in kwargs:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _send_request(self, method: str, url: str, headers: Dict[str, str], **kwargs) -> requests.Response:
+        return self.session.request(
+            method,
+            url,
+            headers=headers,
+            timeout=settings.API_TIMEOUT,
+            **kwargs,
+        )
+
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict]:
         """
         Make an authenticated request to the Robinhood API.
         Handles signing, error logging, and returns JSON response.
         """
+        if time.time() < self.circuit_open_until:
+            self.logger.error("Circuit breaker open - skipping request")
+            return None
+        attempts = 0
+        while attempts <= settings.RETRY_MAX:
+            attempts += 1
+            try:
+                self.rate_limiter.wait()
+                url = self._build_url(endpoint)
+                self.logger.debug(f"Making request to: {url}")
+                self.logger.debug(f"Method: {method}")
+                self.logger.debug(f"Kwargs: {kwargs}")
+                body = self._prepare_body(kwargs)
+                headers = self._prepare_headers(method, endpoint, body, kwargs)
+                self.logger.debug(f"Request headers: {headers}")
+                response = self._send_request(method, url, headers, **kwargs)
+                self.logger.debug(f"Response status: {response.status_code}")
+                self.logger.debug(f"Response headers: {dict(response.headers)}")
+                if response.status_code in [200, 201]:
+                    self.failure_count = 0
+                    resp_json = response.json()
+                    self.logger.debug(f"Response JSON: {resp_json}")
+                    return resp_json
+                self._handle_error_response(response)
+            except requests.exceptions.Timeout:
+                self.logger.error("Request timeout")
+                self._record_failure()
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Request error: {str(e)}")
+                self._record_failure()
+            if attempts <= settings.RETRY_MAX:
+                backoff = min(
+                    settings.RETRY_BACKOFF_BASE * (2 ** (attempts - 1)),
+                    settings.RETRY_BACKOFF_MAX,
+                )
+                time.sleep(backoff)
+        return None
+
+    def _handle_error_response(self, response: requests.Response):
+        status = response.status_code
+        url = getattr(response, "url", "unknown")
         try:
-            url = f"https://trading.robinhood.com{endpoint}"
-            self.logger.debug(f"Making request to: {url}")
-            self.logger.debug(f"Method: {method}")
-            self.logger.debug(f"Kwargs: {kwargs}")
-            body = ""
-            if 'json' in kwargs:
-                body = json.dumps(kwargs['json'])
-                self.logger.debug(f"Request body: {body}")
-            headers = self._sign_request(method, endpoint, body)
-            if 'json' in kwargs:
-                headers['Content-Type'] = 'application/json'
-            self.logger.debug(f"Request headers: {headers}")
-            response = self.session.request(
-                method,
-                url,
-                headers=headers,
-                timeout=10,
-                **kwargs
+            response_text = response.text[:500]  # Limit response text length
+        except Exception:
+            response_text = "Unable to read response"
+        
+        if status == 404:
+            self.logger.error(
+                f"Endpoint not found (404): {url}\n"
+                f"This could mean:\n"
+                f"  1. The API endpoint has changed\n"
+                f"  2. Your API credentials are invalid\n"
+                f"  3. Your account doesn't have access to this endpoint\n"
+                f"Response: {response_text}"
             )
-            self.logger.debug(f"Response status: {response.status_code}")
-            self.logger.debug(f"Response headers: {dict(response.headers)}")
-            if response.status_code in [200, 201]:
-                resp_json = response.json()
-                self.logger.debug(f"Response JSON: {resp_json}")
-                return resp_json
-            else:
-                self.logger.error(f"API request failed: {response.status_code}")
-                try:
-                    self.logger.error(f"Response content: {response.text}")
-                except:
-                    pass
-                return None
-        except requests.exceptions.Timeout:
-            self.logger.error("Request timeout")
-            return None
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request error: {str(e)}")
-            return None
+        elif status in (401, 403):
+            self.logger.error(
+                f"Authentication failed ({status}). Check API credentials.\n"
+                f"Make sure your API_KEY and BASE64_PRIVATE_KEY are correct in your .env file.\n"
+                f"Response: {response_text}"
+            )
+        elif status == 429:
+            self.logger.error("Rate limit exceeded. Retrying may help.")
+        elif 500 <= status < 600:
+            self.logger.error(f"Server error from Robinhood API ({status}).")
+        else:
+            self.logger.error(f"API request failed: {status}")
+        
+        if response_text:
+            self.logger.error(f"Response content: {response_text}")
+        self._record_failure()
+
+    def _record_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= settings.CIRCUIT_BREAKER_THRESHOLD:
+            self.circuit_open_until = time.time() + settings.CIRCUIT_BREAKER_TIMEOUT
 
     def authenticate(self) -> bool:
         """
         Authenticate with Robinhood by making a test call to the accounts endpoint.
         Returns True if successful, False otherwise.
         """
+        # Base URL validation is handled in settings.py; this is a safeguard.
+        if "api.robinhood.com" in settings.ROBINHOOD_API_BASE_URL and "trading.robinhood.com" not in settings.ROBINHOOD_API_BASE_URL:
+            self.logger.warning(
+                f"Using potentially incorrect API base URL: {settings.ROBINHOOD_API_BASE_URL}\n"
+                f"The recommended base URL is: https://trading.robinhood.com\n"
+                f"Attempting authentication anyway..."
+            )
+        
         try:
             self.logger.info("Attempting authentication...")
             response = self._make_request('GET', self.ACCOUNTS_ENDPOINT)
@@ -173,7 +267,6 @@ class RobinhoodClient:
         Robinhood API requires asset_quantity for market orders, so we calculate it from the current price.
         """
         try:
-            import uuid
             from decimal import Decimal
             
             # Get current price to calculate asset quantity
@@ -215,7 +308,6 @@ class RobinhoodClient:
         Place a market sell order for a given symbol and asset quantity.
         """
         try:
-            import uuid
             order_data = {
                 "client_order_id": str(uuid.uuid4()),
                 "symbol": symbol.upper(),
@@ -351,7 +443,6 @@ class RobinhoodClient:
             time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
         """
         try:
-            import uuid
             order_data = {
                 "client_order_id": str(uuid.uuid4()),
                 "symbol": symbol.upper(),
@@ -381,7 +472,6 @@ class RobinhoodClient:
             time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
         """
         try:
-            import uuid
             order_data = {
                 "client_order_id": str(uuid.uuid4()),
                 "symbol": symbol.upper(),
@@ -412,7 +502,6 @@ class RobinhoodClient:
             time_in_force: 'gtc' (good till canceled) or 'ioc' (immediate or cancel)
         """
         try:
-            import uuid
             order_data = {
                 "client_order_id": str(uuid.uuid4()),
                 "symbol": symbol.upper(),

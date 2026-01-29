@@ -11,6 +11,8 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 from tabulate import tabulate
 from src.api.robinhood_client import RobinhoodClient
+from src.analytics.portfolio_analyzer import compute_portfolio_stats
+from src.utils.symbols import normalize_symbol_to_usd, validate_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +57,13 @@ class TradingBot:
         rows = []
         total_value = Decimal('0')
         for holding in holdings['results']:
-            asset_code = holding.get('asset_code', 'UNKNOWN')
+            asset_code = holding.get('asset_code') or holding.get('symbol', 'UNKNOWN').replace('-USD', '')
             symbol = f"{asset_code}-USD"
-            quantity = Decimal(holding.get('quantity_available_for_trading', '0'))
+            quantity = Decimal(
+                holding.get('quantity_available_for_trading')
+                or holding.get('quantity')
+                or '0'
+            )
             # Get current price for this asset
             price_data = self.client.get_crypto_price(symbol)
             current_price = Decimal(price_data.get('price', '0')) if price_data else Decimal('0')
@@ -86,13 +92,15 @@ class TradingBot:
             return "No symbols provided."
         rows = []
         for symbol in symbols:
-            # Normalize to -USD format
-            if not symbol.endswith('-USD'):
-                symbol = f"{symbol}-USD"
+            symbol = normalize_symbol_to_usd(symbol)
             price_data = self.client.get_crypto_price(symbol)
             if price_data:
                 price = Decimal(price_data.get('price', '0'))
-                rows.append([symbol, f"${price:.2f}"])
+                if price < Decimal("1"):
+                    price_display = f"${price:.8f}".rstrip("0").rstrip(".")
+                else:
+                    price_display = f"${price:.2f}"
+                rows.append([symbol, price_display])
             else:
                 rows.append([symbol, 'N/A'])
         return tabulate(
@@ -107,10 +115,9 @@ class TradingBot:
         """
         if amount <= 0:
             raise ValueError("Amount must be greater than 0")
-        if not self._validate_symbol(symbol):
+        if not validate_symbol(symbol):
             raise ValueError("Invalid symbol format")
-        if not symbol.endswith('-USD'):
-            symbol = f"{symbol}-USD"
+        symbol = normalize_symbol_to_usd(symbol)
         
         # Check buying power before attempting to place order
         buying_power = self.client.get_buying_power()
@@ -139,16 +146,20 @@ class TradingBot:
         """
         if amount <= 0:
             raise ValueError("Amount must be greater than 0")
-        if not self._validate_symbol(symbol):
+        if not validate_symbol(symbol):
             raise ValueError("Invalid symbol format")
-        if not symbol.endswith('-USD'):
-            symbol = f"{symbol}-USD"
+        symbol = normalize_symbol_to_usd(symbol)
         holdings = self.client.get_holdings()
         if not holdings or 'results' not in holdings:
             raise ValueError("No holdings found")
         asset_code = symbol.replace('-USD', '')
         holding = next(
-            (h for h in holdings['results'] if h.get('asset_code') == asset_code),
+            (
+                h for h in holdings['results']
+                if h.get('asset_code') == asset_code
+                or h.get('symbol') == symbol
+                or h.get('symbol') == asset_code
+            ),
             None
         )
         if not holding:
@@ -163,7 +174,11 @@ class TradingBot:
         # Round to 8 decimal places to avoid Robinhood's decimal place limit
         quantity_to_sell_rounded = quantity_to_sell.quantize(Decimal('0.00000001'), rounding='ROUND_DOWN')
         
-        current_quantity = Decimal(holding.get('quantity_available_for_trading', '0'))
+        current_quantity = Decimal(
+            holding.get('quantity_available_for_trading')
+            or holding.get('quantity')
+            or '0'
+        )
         if quantity_to_sell_rounded > current_quantity:
             raise ValueError(
                 f"Insufficient {symbol} balance\n"
@@ -191,9 +206,13 @@ class TradingBot:
             return "No holdings found."
         performance = []
         for holding in holdings['results']:
-            asset_code = holding.get('asset_code', 'UNKNOWN')
+            asset_code = holding.get('asset_code') or holding.get('symbol', 'UNKNOWN').replace('-USD', '')
             symbol = f"{asset_code}-USD"
-            quantity = Decimal(holding.get('quantity_available_for_trading', '0'))
+            quantity = Decimal(
+                holding.get('quantity_available_for_trading')
+                or holding.get('quantity')
+                or '0'
+            )
             price_data = self.client.get_crypto_price(symbol)
             current_price = Decimal(price_data.get('price', '0')) if price_data else Decimal('0')
             value = quantity * current_price
@@ -221,10 +240,67 @@ class TradingBot:
         result += perf_table(bottom, "\nWorst 3 Performers (by value)")
         return result
 
-    @staticmethod
-    def _validate_symbol(symbol: str) -> bool:
-        """
-        Validate that a symbol is in the correct format (e.g., BTC or BTC-USD).
-        """
-        import re
-        return bool(re.match(r'^[A-Z0-9]+(-USD)?$', symbol)) 
+    def portfolio_stats(self) -> str:
+        """Return detailed portfolio stats."""
+        holdings = self.client.get_holdings()
+        if not holdings or "results" not in holdings:
+            return "No holdings found."
+        prices = {}
+        for holding in holdings["results"]:
+            asset_code = holding.get("asset_code") or holding.get("symbol", "UNKNOWN").replace("-USD", "")
+            symbol = f"{asset_code}-USD"
+            price_data = self.client.get_crypto_price(symbol)
+            prices[symbol] = price_data.get("price", "0") if price_data else "0"
+        buying_power = self.client.get_buying_power()
+        stats = compute_portfolio_stats(holdings, prices, buying_power)
+        rows = [
+            [
+                p["symbol"],
+                f"{p['quantity']:.8f}",
+                f"${p['price']:.2f}",
+                f"${p['value']:.2f}",
+            ]
+            for p in stats["positions"]
+        ]
+        table = tabulate(
+            rows,
+            headers=["Symbol", "Quantity", "Price", "Value"],
+            tablefmt="grid",
+        )
+        total_value = stats["total_value"]
+        return f"{table}\n\nTotal Value: ${total_value:.2f}\nBuying Power: ${buying_power:,.2f}"
+
+    def trade_history(self, symbol: Optional[str] = None, limit: Optional[int] = None) -> Dict:
+        """Fetch filled orders as trade history."""
+        return self.client.get_orders(symbol=symbol, state="filled", limit=limit) or {"results": []}
+
+    def place_limit_order(self, symbol: str, side: str, amount: float, limit_price: float) -> Optional[Dict]:
+        """Place a limit order."""
+        if amount <= 0 or limit_price <= 0:
+            raise ValueError("Amount and limit price must be greater than 0")
+        if not validate_symbol(symbol):
+            raise ValueError("Invalid symbol format")
+        symbol = normalize_symbol_to_usd(symbol)
+        return self.client.place_limit_order(symbol, side, str(amount), str(limit_price))
+
+    def place_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> Optional[Dict]:
+        """Place a stop loss order."""
+        if amount <= 0 or stop_price <= 0:
+            raise ValueError("Amount and stop price must be greater than 0")
+        if not validate_symbol(symbol):
+            raise ValueError("Invalid symbol format")
+        symbol = normalize_symbol_to_usd(symbol)
+        return self.client.place_stop_loss_order(symbol, side, str(amount), str(stop_price))
+
+    def place_stop_limit_order(
+        self, symbol: str, side: str, amount: float, limit_price: float, stop_price: float
+    ) -> Optional[Dict]:
+        """Place a stop limit order."""
+        if amount <= 0 or limit_price <= 0 or stop_price <= 0:
+            raise ValueError("Amount, limit price, and stop price must be greater than 0")
+        if not validate_symbol(symbol):
+            raise ValueError("Invalid symbol format")
+        symbol = normalize_symbol_to_usd(symbol)
+        return self.client.place_stop_limit_order(
+            symbol, side, str(amount), str(limit_price), str(stop_price)
+        )

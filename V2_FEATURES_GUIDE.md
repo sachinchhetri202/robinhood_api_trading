@@ -365,7 +365,6 @@ python main.py auto-trade
 
 ### Pro Tips for V2
 
-- **Use the example script**: `python examples/automated_trading_example.py`
 - **Monitor your strategies**: Check portfolio performance regularly
 - **Start conservative**: Use small amounts and tight stop losses initially
 - **Combine strategies**: Use both stop loss and DCA for diversification
@@ -430,4 +429,17 @@ Start with the automated trading features and see how they can work for you. Rem
 
 ---
 
-**Need help?** Check the main README.md for basic setup instructions, or use the troubleshooting section above for V2-specific issues. 
+## Standalone Executable
+
+You can create a double-clickable trading shell using PyInstaller:
+
+```bash
+python scripts/build_executable.py
+./dist/RobinhoodTradingCLI
+```
+
+Keep your `.env` file in the folder where you run the executable.
+
+---
+
+**Need help?** Check the main README.md for basic setup instructions, or use the troubleshooting section above for V2-specific issues.  
