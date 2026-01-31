@@ -12,7 +12,7 @@ def configure_logging(
     log_dir: Optional[Path] = None,
 ):
     """Configure root logging with optional file output."""
-    level = logging.DEBUG if debug else logging.INFO
+    level = logging.DEBUG if debug else logging.ERROR
     handlers = [logging.StreamHandler()]
 
     if log_to_file and log_dir:
@@ -30,4 +30,4 @@ def configure_logging(
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
     )
-    logging.getLogger("urllib3").setLevel(logging.DEBUG if debug else logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.DEBUG if debug else logging.ERROR)

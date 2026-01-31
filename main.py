@@ -48,10 +48,10 @@ def cli(ctx, debug, log_file):
     configure_logging(debug=debug, log_to_file=log_file or settings.LOG_TO_FILE, log_dir=settings.LOG_DIR)
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
     else:
-        logging.getLogger().setLevel(logging.INFO)
-        logging.getLogger('urllib3').setLevel(logging.WARNING)
+        logging.getLogger().setLevel(logging.ERROR)
+        logging.getLogger("urllib3").setLevel(logging.ERROR)
 
     if ctx.invoked_subcommand is None:
         start_interactive_shell()
@@ -89,6 +89,10 @@ def start_interactive_shell():
         try:
             args = shlex.split(user_input)
             cli.main(args=args, prog_name="main.py", standalone_mode=False)
+        except click.ClickException as e:
+            # Show Click's formatted error and keep the shell running
+            e.show()
+            continue
         except SystemExit:
             # Prevent shell from exiting on command errors
             continue

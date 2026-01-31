@@ -6,6 +6,7 @@ Author: Sachin Chhetri
 This class provides user-friendly methods for portfolio display, price lookup, and trading operations.
 """
 
+import difflib
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -26,6 +27,49 @@ class TradingBot:
         Initialize the trading bot with a RobinhoodClient instance.
         """
         self.client = RobinhoodClient()
+        self._valid_symbols: Optional[set] = None
+
+    def _get_valid_symbols(self) -> set:
+        """Fetch and cache valid trading pair symbols (e.g., BTC-USD)."""
+        if self._valid_symbols is not None:
+            return self._valid_symbols
+        result = self.client.get_trading_pairs()
+        symbols = set()
+        if result and "results" in result:
+            for pair in result["results"]:
+                symbol = pair.get("symbol")
+                if symbol:
+                    symbols.add(symbol.upper())
+        self._valid_symbols = symbols
+        return symbols
+
+    def _suggest_symbol(self, raw_symbol: str, valid_symbols: set) -> Optional[str]:
+        """Suggest the closest matching symbol if possible."""
+        normalized = normalize_symbol_to_usd(raw_symbol)
+        asset = normalized.replace("-USD", "")
+        assets = [s.replace("-USD", "") for s in valid_symbols]
+        match = difflib.get_close_matches(asset, assets, n=1, cutoff=0.6)
+        if match:
+            return f"{match[0]}-USD"
+        # Fallback: prefix match (e.g., DOG -> DOGE)
+        prefix_matches = [a for a in assets if a.startswith(asset)]
+        if prefix_matches:
+            prefix_matches.sort(key=len)
+            return f"{prefix_matches[0]}-USD"
+        return None
+
+    def _ensure_valid_symbol(self, raw_symbol: str) -> str:
+        """Normalize symbol and validate against trading pairs if available."""
+        if not validate_symbol(raw_symbol):
+            raise ValueError("Invalid symbol format")
+        normalized = normalize_symbol_to_usd(raw_symbol)
+        valid_symbols = self._get_valid_symbols()
+        if valid_symbols and normalized not in valid_symbols:
+            suggestion = self._suggest_symbol(normalized, valid_symbols)
+            if suggestion:
+                raise ValueError(f"Unknown symbol {normalized}. Did you mean {suggestion}?")
+            raise ValueError(f"Unknown symbol {normalized}.")
+        return normalized
 
     def authenticate(self) -> bool:
         """
@@ -90,9 +134,17 @@ class TradingBot:
         """
         if not symbols:
             return "No symbols provided."
+        valid_symbols = self._get_valid_symbols()
         rows = []
         for symbol in symbols:
             symbol = normalize_symbol_to_usd(symbol)
+            if valid_symbols and symbol not in valid_symbols:
+                suggestion = self._suggest_symbol(symbol, valid_symbols)
+                if suggestion:
+                    rows.append([symbol, f"N/A (Did you mean {suggestion}?)"])
+                else:
+                    rows.append([symbol, "N/A"])
+                continue
             price_data = self.client.get_crypto_price(symbol)
             if price_data:
                 price = Decimal(price_data.get('price', '0'))
@@ -115,9 +167,7 @@ class TradingBot:
         """
         if amount <= 0:
             raise ValueError("Amount must be greater than 0")
-        if not validate_symbol(symbol):
-            raise ValueError("Invalid symbol format")
-        symbol = normalize_symbol_to_usd(symbol)
+        symbol = self._ensure_valid_symbol(symbol)
         
         # Check buying power before attempting to place order
         buying_power = self.client.get_buying_power()
@@ -146,9 +196,7 @@ class TradingBot:
         """
         if amount <= 0:
             raise ValueError("Amount must be greater than 0")
-        if not validate_symbol(symbol):
-            raise ValueError("Invalid symbol format")
-        symbol = normalize_symbol_to_usd(symbol)
+        symbol = self._ensure_valid_symbol(symbol)
         holdings = self.client.get_holdings()
         if not holdings or 'results' not in holdings:
             raise ValueError("No holdings found")
@@ -278,18 +326,14 @@ class TradingBot:
         """Place a limit order."""
         if amount <= 0 or limit_price <= 0:
             raise ValueError("Amount and limit price must be greater than 0")
-        if not validate_symbol(symbol):
-            raise ValueError("Invalid symbol format")
-        symbol = normalize_symbol_to_usd(symbol)
+        symbol = self._ensure_valid_symbol(symbol)
         return self.client.place_limit_order(symbol, side, str(amount), str(limit_price))
 
     def place_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> Optional[Dict]:
         """Place a stop loss order."""
         if amount <= 0 or stop_price <= 0:
             raise ValueError("Amount and stop price must be greater than 0")
-        if not validate_symbol(symbol):
-            raise ValueError("Invalid symbol format")
-        symbol = normalize_symbol_to_usd(symbol)
+        symbol = self._ensure_valid_symbol(symbol)
         return self.client.place_stop_loss_order(symbol, side, str(amount), str(stop_price))
 
     def place_stop_limit_order(
@@ -298,9 +342,7 @@ class TradingBot:
         """Place a stop limit order."""
         if amount <= 0 or limit_price <= 0 or stop_price <= 0:
             raise ValueError("Amount, limit price, and stop price must be greater than 0")
-        if not validate_symbol(symbol):
-            raise ValueError("Invalid symbol format")
-        symbol = normalize_symbol_to_usd(symbol)
+        symbol = self._ensure_valid_symbol(symbol)
         return self.client.place_stop_limit_order(
             symbol, side, str(amount), str(limit_price), str(stop_price)
         )

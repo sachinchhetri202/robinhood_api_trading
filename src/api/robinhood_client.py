@@ -12,7 +12,6 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Dict, Optional, List
 import requests
 from nacl.signing import SigningKey
@@ -41,6 +40,7 @@ class RobinhoodClient:
         self.rate_limiter = RateLimiter(settings.RATE_LIMIT_PER_MINUTE)
         self.failure_count = 0
         self.circuit_open_until = 0
+        self._ntp_offset: Optional[float] = None  # Clock skew correction from NTP
         # Prepare Ed25519 signing key
         if not settings.BASE64_PRIVATE_KEY:
             raise ValueError(
@@ -57,10 +57,28 @@ class RobinhoodClient:
             )
         # Do not set log level here; let main CLI control it
 
-    @staticmethod
-    def _get_current_timestamp() -> int:
-        """Get current UTC timestamp in seconds."""
-        return int(datetime.now(tz=timezone.utc).timestamp())
+    def _get_current_timestamp(self) -> int:
+        """Get current Unix timestamp in seconds. Applies NTP offset if clock skew was detected."""
+        ts = time.time()
+        if self._ntp_offset is not None:
+            ts += self._ntp_offset
+        return int(ts)
+
+    def _sync_ntp_offset(self) -> bool:
+        """Try to get clock offset from NTP server. Returns True if successful."""
+        try:
+            import ntplib
+            client = ntplib.NTPClient()
+            response = client.request("pool.ntp.org", version=3, timeout=3)
+            self._ntp_offset = response.offset
+            self.logger.info(f"Clock skew corrected: offset={self._ntp_offset:.2f}s")
+            return True
+        except ImportError:
+            self.logger.debug("ntplib not installed - run: pip install ntplib")
+            return False
+        except Exception as e:
+            self.logger.debug(f"NTP sync failed: {e}")
+            return False
 
     @staticmethod
     def _round_asset_quantity(asset_quantity: str) -> str:
@@ -157,12 +175,22 @@ class RobinhoodClient:
                     resp_json = response.json()
                     self.logger.debug(f"Response JSON: {resp_json}")
                     return resp_json
-                self._handle_error_response(response)
+                if attempts <= settings.RETRY_MAX:
+                    self._handle_error_response(response, is_retry=True)
+                else:
+                    self._handle_error_response(response, is_retry=False)
+                    return None
             except requests.exceptions.Timeout:
-                self.logger.error("Request timeout")
+                if attempts <= settings.RETRY_MAX:
+                    self.logger.debug("Request timeout")
+                else:
+                    self.logger.error("Request timeout")
                 self._record_failure()
             except requests.exceptions.RequestException as e:
-                self.logger.error(f"Request error: {str(e)}")
+                if attempts <= settings.RETRY_MAX:
+                    self.logger.debug(f"Request error: {str(e)}")
+                else:
+                    self.logger.error(f"Request error: {str(e)}")
                 self._record_failure()
             if attempts <= settings.RETRY_MAX:
                 backoff = min(
@@ -172,16 +200,17 @@ class RobinhoodClient:
                 time.sleep(backoff)
         return None
 
-    def _handle_error_response(self, response: requests.Response):
+    def _handle_error_response(self, response: requests.Response, is_retry: bool = False):
         status = response.status_code
         url = getattr(response, "url", "unknown")
         try:
             response_text = response.text[:500]  # Limit response text length
         except Exception:
             response_text = "Unable to read response"
+        log = self.logger.debug if is_retry else self.logger.error
         
         if status == 404:
-            self.logger.error(
+            log(
                 f"Endpoint not found (404): {url}\n"
                 f"This could mean:\n"
                 f"  1. The API endpoint has changed\n"
@@ -190,20 +219,36 @@ class RobinhoodClient:
                 f"Response: {response_text}"
             )
         elif status in (401, 403):
-            self.logger.error(
+            if "Timestamp is invalid" in response_text:
+                if is_retry:
+                    self.logger.debug("Timestamp rejected - attempting NTP clock sync.")
+                else:
+                    self.logger.warning("Timestamp rejected - your system clock may be out of sync.")
+                if self._sync_ntp_offset():
+                    if is_retry:
+                        self.logger.debug("Retrying with NTP-corrected timestamp.")
+                    else:
+                        self.logger.info("Retrying with NTP-corrected timestamp...")
+                else:
+                    if not is_retry:
+                        self.logger.error(
+                            "Install ntplib for automatic clock sync: pip install ntplib\n"
+                            "Or sync your system clock: Settings > Time & Language > Sync now (Windows)"
+                        )
+            log(
                 f"Authentication failed ({status}). Check API credentials.\n"
                 f"Make sure your API_KEY and BASE64_PRIVATE_KEY are correct in your .env file.\n"
                 f"Response: {response_text}"
             )
         elif status == 429:
-            self.logger.error("Rate limit exceeded. Retrying may help.")
+            log("Rate limit exceeded. Retrying may help.")
         elif 500 <= status < 600:
-            self.logger.error(f"Server error from Robinhood API ({status}).")
+            log(f"Server error from Robinhood API ({status}).")
         else:
-            self.logger.error(f"API request failed: {status}")
+            log(f"API request failed: {status}")
         
         if response_text:
-            self.logger.error(f"Response content: {response_text}")
+            log(f"Response content: {response_text}")
         self._record_failure()
 
     def _record_failure(self):
